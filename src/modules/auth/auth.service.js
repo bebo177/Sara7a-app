@@ -1,0 +1,265 @@
+import { JwtAdminSignature, JwtUserSignature } from "../../../config/env.service.js";
+import { compareHash, decodeRefreshToken, generateHash, generateToken, NOTE_SAFE_PROJECTION, ProviderEnums } from "../../common/index.js";
+import { BadRequestException, ConflictException, ErrorResponse, NotFoundException, UnAuthorizedException } from "../../common/utils/responses/index.js";
+import { findById, findByIdAndUpdate, findOne, findOneAndUpdate, insertOne, userModel } from "../../database/index.js";
+import jwt from 'jsonwebtoken';
+import {OAuth2Client} from 'google-auth-library';
+import {BASE_URL} from '../../../config/env.service.js';
+import { generateRevokeKey, get, increment, redisDelete, set, ttl } from "../../database/redis.service.js";
+import { event } from "../../common/utils/email/email.events.js";
+import { type } from "os";
+
+export const redisKey = (type, userOrId)=>{
+const id = typeof userOrId === 'object' ? userOrId._id : userOrId;
+return `user::${type}::${id}`;
+};
+
+export const signup = async(data , file)=>{
+    let { userName , email , password , age , shareProfileName , phone} = data;
+    let existUser = await findOne({
+        model : userModel ,
+        filter:{email}
+    });
+if (existUser) {
+    return ConflictException({message: 'user already exists'});
+}
+let image = '';
+if (file){
+    image = `${BASE_URL}/${file.destination}/${file.filename}`;
+}
+let hashedPassword = await generateHash(password);
+
+let addedUser = await insertOne({
+    model:userModel,
+    data: {userName, email , password:hashedPassword , age , shareProfileName , image , phone}
+})
+if (!addedUser) {
+    return ErrorResponse();
+}
+event.emit("verifyEmail",{userId: addedUser._id, email: addedUser.email , userName: addedUser.userName});
+return addedUser;
+}
+
+export const verifyEmail = async({code, email})=>{
+    let user = await findOne({
+       model: userModel,
+        filter: {email}
+    })
+    if(!user){
+        throw NotFoundException({message: 'user not found'});
+    }
+    if(user.isVerified == 1){
+        throw BadRequestException({message:'user is already verified'});
+    }
+    let redisCode = await get(redisKey('OTP',user));
+    let compared = await compareHash(code, redisCode);
+    if(!compared) {
+        throw UnAuthorizedException({message:'Incorrect OTP'})
+    }
+    user = await findOneAndUpdate({
+        model: userModel,
+        filter: {_id: user._id},
+        update: {isVerified: true},
+       options: {returnDocument: 'after'}
+    })
+    if(!user){
+        throw BadRequestException({message: 'unexpected error'});
+    }
+    event.emit('Confirmation', {email: user.email, userName: user.userName});
+    return {user}
+}
+
+export const login = async(data,issuer)=>{
+    let {email , password} = data;
+    let userCacheKey = `user::${email}`;
+    let bannedUserKey = `user::banned::${email}`
+    let blockingTime = Math.ceil(await ttl(bannedUserKey)/ 60)
+    if (await get(bannedUserKey)){
+        throw UnAuthorizedException({message:`user is banned because too many attempts try again within ${blockingTime} minuted`})
+    }
+    let userData = await findOne({
+        model: userModel,
+        filter: {email, provider: ProviderEnums.System},
+        select: `${NOTE_SAFE_PROJECTION}`
+    });
+    if (userData) {
+        const isMatched = await compareHash(password,userData.password);
+        if (isMatched) {
+            await redisDelete(userCacheKey);
+            if (userData.twoStepVerfication){
+        
+            }
+            let { accessToken , refreshToken } = await generateToken(userData, issuer);
+            return {userData, accessToken, refreshToken};
+        }
+        if (await get(userCasheKey)) {
+            await increment(userCacheKey);
+            if (await get(userCacheKey)== 5){
+                await set({
+                    key: bannedUserKey,
+                    value: "true",
+                    ttl: 5 * 60
+                })
+                await redisDelete(userCacheKey);
+            }
+        } else {
+            await set({
+                key: userCacheKey,
+                value: 1
+            })
+        }
+        return NotFoundException({message: "incorrect password"})
+    }
+    return NotFoundException({message: 'user not found'});
+}
+
+export const twoStepLoginVerify = async(Credential , issuer)=>{
+    let {email,code} = Credential;
+    let user = await findOne({
+        model : userModel,
+        filter: {email}
+    })
+    if (!user) {
+        userNotFound();
+    }
+    await verifyOTP(email,code,"OTP::login")
+    event.emit("twoStepLoginVerify",user);
+    let { accessToken , refreshToken } = await generateToken(user , issuer);
+    return { user , accessToken , refreshToken};
+}
+
+export const toggleTwoStepVerfication = async(userId)=>{
+    let user = await findById({
+        model: userModel,
+        id: userId,
+    });
+    if (!user){
+        userNotFound();
+    }
+    console.log(user);
+    event.emit("toggle",user);
+
+    return;
+    
+}
+
+
+export const verifyTwoStep = async(userId , data)=>{
+    let { code } = data;
+    let user = await findById({
+        model: userModel,
+        id: userId,
+        update: { twoStepVerfication: !user.twoStepVerfication},
+        options: { returnDocument: 'after'}
+    })
+
+    event.emit("verifyTwoStep", updatedUser);
+    return {email};
+}
+
+
+
+
+export const generateAccessToken = async (token)=>{
+    let decodedData = decodeRefreshToken(token);
+    let signature = undefined;
+    switch (decodedData.aud){
+        case 'Admin':
+            signature = JwtAdminSignature;
+            break;
+
+            default: signature = JwtUserSignature;
+            break;
+    }
+
+    const accessToken = jwt.sign({id: decodedData.id}, signature, {
+        expiresIn: '30m',
+        audience: decodedData.aud
+    })
+
+    return accessToken;
+}
+
+export const signupGoogle = async(data)=>{
+    let { idToken } = data;
+    const client = new OAuth2Client();
+    const ticket = await client.verifyIdToken({
+        idToken,
+        audience: WEB_CLIENT_ID
+    });
+    const paylaod = ticket.getPayload();
+    if(!paylaod.email_verified) {
+        throw BadRequestException('email not verified');
+    }
+
+    let existUser = await findOne({model: userModel, filter: {email: paylaod.email}});
+    if (existUser) {
+        throw ConflictException("user already exists");
+    }
+    let addedUser = await insertOne({
+        model: userModel,
+        data:{
+            userName: paylaod.name,
+            email: paylaod.email
+        }
+    })
+
+    if(!addedUser){
+        throw BadRequestException('something went wrong');
+    }
+    return addedUser;
+}
+
+export const logout = async (req)=> {
+    let {userId , decoded} = req;
+    let {jti} = decoded;
+    const revokeToken = generateRevokeKey ({userId,jti})
+    await redisDelete(revokeToken);
+}
+
+export const forgetPassword = async({email})=>{
+    let user = await findOne({
+        model: userModel,
+        filter: {email}
+    });
+    if (!user) {
+        userNotFound();
+    }
+    event.emit("forgetPassword", user);
+    return {email};
+}
+
+export const resetPassword = async (data)=>{
+    let {email , code , password , confirmPassword} = data;
+    let user = await findOne({
+        model: userModel,
+        filter: {email}
+    });
+    if (!user) {
+        userNotFound();
+    }
+
+    if (password !== confirmPassword) {
+        throw ConflictException({message: "Confirm Password Must Be Match With Password"});
+    }
+    await verifyOTP(email , code , "OTP::reset");
+    let matched = await compareHash(password , user.password);
+    if(matched){
+        throw BadRequestException({message: "New Password Cant Be The Same With Old Password"});
+    }
+    let hashedPassword = await generateHash(password);
+
+    let updatedUser = await findByIdAndUpdate({
+        model: userModel,
+        id: user._id,
+        update: {password: hashedPassword},
+        options: {returnDocument: 'after'}
+    });
+     
+    if (!updatedUser){
+        throw BadRequestException('something went wrong');
+    }
+    
+    event.emit("resetPassword",user);
+    return {email};
+}
